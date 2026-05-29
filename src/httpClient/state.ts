@@ -12,6 +12,22 @@ import {
 } from "./types";
 
 export const HTTP_CLIENT_STORAGE_KEY = "notepad-plus-web-http-client";
+export const DEFAULT_REQUEST_HEADERS: Array<Pick<KeyValueRow, "key" | "value" | "enabled">> = [
+  { key: "Accept", value: "*/*", enabled: true },
+  { key: "User-Agent", value: "NotepadPlusWeb/0.1", enabled: true },
+];
+
+export function contentTypeForBodyMode(mode: HttpBody["mode"]): string | undefined {
+  if (mode === "json") return "application/json; charset=UTF-8";
+  if (mode === "form-urlencoded") return "application/x-www-form-urlencoded";
+  if (mode === "multipart") return "multipart/form-data";
+  return undefined;
+}
+
+export function isAutoContentType(value: string): boolean {
+  const normalized = value.toLowerCase();
+  return normalized === "application/json" || normalized === "application/json; charset=utf-8" || normalized === "application/x-www-form-urlencoded" || normalized === "multipart/form-data";
+}
 
 export function createId(): string {
   return crypto.randomUUID();
@@ -19,6 +35,10 @@ export function createId(): string {
 
 export function createRow(key = "", value = "", enabled = true): KeyValueRow {
   return { id: createId(), key, value, enabled };
+}
+
+export function createDefaultHeaderRows(): KeyValueRow[] {
+  return DEFAULT_REQUEST_HEADERS.map((header) => createRow(header.key, header.value, header.enabled));
 }
 
 export function createBody(mode: HttpBody["mode"] = "none", raw = ""): HttpBody {
@@ -31,10 +51,12 @@ export function createRequest(name = "Untitled Request", method: HttpMethod = "G
     name,
     method,
     url,
-    headers: [createRow()],
+    headers: [...createDefaultHeaderRows(), createRow()],
     params: [createRow()],
+    cookies: [createRow()],
     auth: { type: "none" },
     body: createBody(),
+    scripts: { preRequest: "", test: "" },
   };
 }
 
@@ -55,20 +77,19 @@ export function createEnvironment(name = "Local"): HttpEnvironment {
 }
 
 export function createInitialHttpState(): HttpClientState {
-  const request = createRequest("GET httpbin", "GET", "{{baseUrl}}/get");
+  const request = createRequest();
   const collection = createCollection("My Requests");
   collection.items.push(request);
-  const environment = createEnvironment();
   return {
     collections: [collection],
-    environments: [environment],
+    environments: [],
     activeCollectionId: collection.id,
     activeRequestId: request.id,
-    activeEnvironmentId: environment.id,
+    activeEnvironmentId: undefined,
     draft: cloneRequest(request),
     history: [],
     ui: {
-      historyVisible: true,
+      historyVisible: false,
       responseWidth: 42,
       responseHeight: 52,
       requestPanel: "params",
@@ -136,7 +157,7 @@ export function clampResponseHeight(value: number): number {
 }
 
 function normalizeRequestPanel(value: unknown): NonNullable<HttpClientState["ui"]>["requestPanel"] {
-  return ["params", "auth", "headers", "body", "scripts", "settings"].includes(String(value)) ? (value as NonNullable<HttpClientState["ui"]>["requestPanel"]) : "params";
+  return ["params", "auth", "headers", "body", "cookies", "scripts", "settings"].includes(String(value)) ? (value as NonNullable<HttpClientState["ui"]>["requestPanel"]) : "params";
 }
 
 function normalizeResponsePanel(value: unknown): NonNullable<HttpClientState["ui"]>["responsePanel"] {
@@ -254,15 +275,18 @@ function normalizeCollectionItem(item: Partial<HttpFolder & HttpRequestItem>): H
 }
 
 function normalizeRequest(request: Partial<HttpRequestItem>): HttpRequestItem {
+  const body = normalizeBody(request.body);
   return {
     id: typeof request.id === "string" ? request.id : createId(),
     name: typeof request.name === "string" ? request.name : "Untitled Request",
     method: normalizeMethod(request.method),
     url: typeof request.url === "string" ? request.url : "",
-    headers: normalizeRows(request.headers),
+    headers: normalizeContentTypeHeader(normalizeHeaders(request.headers), body.mode),
     params: normalizeRows(request.params),
+    cookies: normalizeRows(request.cookies),
     auth: normalizeAuth(request.auth),
-    body: normalizeBody(request.body),
+    body,
+    scripts: normalizeScripts(request.scripts),
   };
 }
 
@@ -282,6 +306,22 @@ function normalizeRows(rows: unknown): KeyValueRow[] {
       })
     : [];
   return result.length ? result : [createRow()];
+}
+
+function normalizeHeaders(rows: unknown): KeyValueRow[] {
+  const normalized = normalizeRows(rows);
+  for (const header of DEFAULT_REQUEST_HEADERS) {
+    if (!normalized.some((row) => row.key.toLowerCase() === header.key.toLowerCase())) {
+      normalized.unshift(createRow(header.key, header.value, header.enabled));
+    }
+  }
+  return normalized;
+}
+
+function normalizeContentTypeHeader(headers: KeyValueRow[], mode: HttpBody["mode"]): KeyValueRow[] {
+  const contentType = contentTypeForBodyMode(mode);
+  if (!contentType || headers.some((row) => row.key.toLowerCase() === "content-type")) return headers;
+  return [...headers, createRow("Content-Type", contentType, true)];
 }
 
 function normalizeMethod(method: unknown): HttpMethod {
@@ -315,5 +355,14 @@ function normalizeBody(body: unknown): HttpBody {
     mode,
     raw: String(value.raw ?? ""),
     form: normalizeRows(value.form),
+  };
+}
+
+function normalizeScripts(scripts: unknown): HttpRequestItem["scripts"] {
+  if (!scripts || typeof scripts !== "object") return { preRequest: "", test: "" };
+  const value = scripts as Partial<HttpRequestItem["scripts"]>;
+  return {
+    preRequest: String(value.preRequest ?? ""),
+    test: String(value.test ?? ""),
   };
 }

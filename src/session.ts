@@ -70,6 +70,10 @@ export function restoreSession(): AppState | undefined {
       .map((tab) =>
         tab.kind === "http"
           ? { ...tab, http: normalizeState(tab.http ?? restoreHttpWorkspace() ?? createInitialHttpState()), handle: undefined }
+          : tab.kind === "zip"
+          ? { ...tab, handle: undefined }
+          : tab.kind === "draw"
+          ? { ...tab, handle: undefined }
           : { ...tab, kind: "text", handle: undefined },
       );
     parsed.activeId = parsed.tabs.some((tab) => tab.id === parsed.activeId) ? parsed.activeId : (parsed.tabs[0]?.id ?? "");

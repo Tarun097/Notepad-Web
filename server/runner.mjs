@@ -349,12 +349,16 @@ async function executeHttpRequest(payload) {
     }
     const contentType = response.headers.get("content-type") || "";
     const textLike = /^text\//i.test(contentType) || /json|xml|javascript|x-www-form-urlencoded/i.test(contentType);
+    const setCookies = typeof response.headers.getSetCookie === "function"
+      ? response.headers.getSetCookie()
+      : splitSetCookieHeader(response.headers.get("set-cookie") || "");
     return {
       status: 200,
       data: {
         status: response.status,
         statusText: response.statusText,
         headers: Array.from(response.headers.entries()).map(([key, value]) => ({ id: randomUUID(), key, value, enabled: true })),
+        cookies: setCookies.map((value) => parseCookie(value)),
         body: textLike || contentType === "" ? bytes.toString("utf8") : bytes.toString("base64"),
         bodyBase64: !(textLike || contentType === ""),
         durationMs: Math.round(performance.now() - started),
@@ -368,6 +372,22 @@ async function executeHttpRequest(payload) {
   } finally {
     clearTimeout(timeout);
   }
+}
+
+function splitSetCookieHeader(value) {
+  if (!value) return [];
+  return value.split(/,(?=\s*[^;,=\s]+=[^;,]+)/g).map((cookie) => cookie.trim()).filter(Boolean);
+}
+
+function parseCookie(value) {
+  const [pair] = value.split(";");
+  const separator = pair.indexOf("=");
+  return {
+    id: randomUUID(),
+    key: separator === -1 ? pair.trim() : pair.slice(0, separator).trim(),
+    value: separator === -1 ? "" : pair.slice(separator + 1).trim(),
+    enabled: true,
+  };
 }
 
 function sanitizeHttpHeaders(headers) {

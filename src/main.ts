@@ -5,6 +5,11 @@ import { editorTheme, visibleWhitespace } from "./editorExtensions";
 import { HttpClientView } from "./httpClient/view";
 import { createInitialHttpState, normalizeState, persistHttpWorkspace, restoreHttpWorkspace } from "./httpClient/state";
 import { HttpClientState } from "./httpClient/types";
+import { ZipExplorerView } from "./zipExplorer/view";
+import { DrawView } from "./drawTool/view";
+import { searchAllZipFiles, searchSingleZipFile } from "./zipExplorer/state";
+import { inferLineEnding, nextUntitledName } from "./tabs";
+import { escapeHtml } from "./search";
 import { defaultExtensionForLanguage, hasKnownExtension, inferLanguage, languageExtension, languageLabels } from "./languages";
 import { addRecentFile, getRecentFiles, removeRecentFileAt } from "./recentFiles";
 import {
@@ -92,6 +97,8 @@ const elements = {
   splitSelect: byId<HTMLSelectElement>("splitSelect"),
   diffView: byId<HTMLDivElement>("diffView"),
   httpClientView: byId<HTMLDivElement>("httpClientView"),
+  zipExplorerView: byId<HTMLDivElement>("zipExplorerView"),
+  drawView: byId<HTMLDivElement>("drawView"),
   openInput: byId<HTMLInputElement>("openInput"),
   languageSelect: byId<HTMLSelectElement>("languageSelect"),
   findInput: byId<HTMLInputElement>("findInput"),
@@ -143,6 +150,8 @@ let editorView: EditorView | undefined;
 let splitEditorView: EditorView | undefined;
 let lastFocusedSplit = false;
 let httpClientView: HttpClientView | undefined;
+let zipExplorerView: ZipExplorerView | undefined;
+let drawView: DrawView | undefined;
 let languageCompartment = new Compartment();
 let wrapCompartment = new Compartment();
 let whitespaceCompartment = new Compartment();
@@ -177,7 +186,7 @@ const DIFF_PAGE_SIZE = 5000;
 const SEARCH_RESULTS_PAGE_SIZE = 500;
 
 type SearchRange = { from: number; to: number; text: string; match?: RegExpExecArray };
-type SearchResult = { tabId: string; from: number; to: number; line: number; column: number; preview: string };
+type SearchResult = { tabId: string; from: number; to: number; line: number; column: number; preview: string; zipPath?: string };
 interface SearchResultSet {
   results: SearchResult[];
   total: number;
@@ -375,6 +384,8 @@ function mountEditor(): void {
     elements.editorSplit.hidden = true;
     elements.diffView.hidden = true;
     elements.httpClientView.hidden = true;
+    elements.zipExplorerView.hidden = true;
+    elements.drawView.hidden = true;
     elements.outputPanel.hidden = true;
     hideSplitChrome();
     return;
@@ -387,6 +398,8 @@ function mountEditor(): void {
     elements.editorSplit.hidden = true;
     elements.diffView.hidden = false;
     elements.httpClientView.hidden = true;
+    elements.zipExplorerView.hidden = true;
+    elements.drawView.hidden = true;
     hideSplitChrome();
     renderDiffTab(tab);
     return;
@@ -398,8 +411,36 @@ function mountEditor(): void {
     elements.editorSplit.hidden = true;
     elements.diffView.hidden = true;
     elements.httpClientView.hidden = false;
+    elements.zipExplorerView.hidden = true;
+    elements.drawView.hidden = true;
     hideSplitChrome();
     renderHttpClientTab(tab);
+    return;
+  }
+
+  if (isZipTab(tab)) {
+    editorView = undefined;
+    elements.editor.hidden = true;
+    elements.editorSplit.hidden = true;
+    elements.diffView.hidden = true;
+    elements.httpClientView.hidden = true;
+    elements.zipExplorerView.hidden = false;
+    elements.drawView.hidden = true;
+    hideSplitChrome();
+    renderZipExplorerTab();
+    return;
+  }
+
+  if (isDrawTab(tab)) {
+    editorView = undefined;
+    elements.editor.hidden = true;
+    elements.editorSplit.hidden = true;
+    elements.diffView.hidden = true;
+    elements.httpClientView.hidden = true;
+    elements.zipExplorerView.hidden = true;
+    elements.drawView.hidden = false;
+    hideSplitChrome();
+    renderDrawTab();
     return;
   }
 
@@ -407,6 +448,8 @@ function mountEditor(): void {
   elements.editorSplit.hidden = false;
   elements.diffView.hidden = true;
   elements.httpClientView.hidden = true;
+  elements.zipExplorerView.hidden = true;
+  elements.drawView.hidden = true;
   languageCompartment = new Compartment();
   wrapCompartment = new Compartment();
   whitespaceCompartment = new Compartment();
@@ -780,7 +823,6 @@ function attachEvents(): void {
     }
 
     if (resultIndex !== undefined) {
-      jumpToSearchResult(Number(resultIndex));
       return;
     }
 
@@ -959,7 +1001,9 @@ function attachEvents(): void {
     }
     hideToolsMenu();
     if (action === "diff") openDiffDialog();
+    else if (action === "draw") openDrawTab();
     else if (action === "http-client") openHttpClientTab();
+    else if (action === "zip-explorer") openZipExplorerTab();
     else if (action === "format-json") formatJson();
     else if (action === "flatten-json") flattenJson();
   });
@@ -1033,7 +1077,7 @@ function attachEvents(): void {
     const startHeight = panel.offsetHeight;
     const onMove = (e: PointerEvent): void => {
       const delta = startY - e.clientY;
-      const newHeight = Math.max(80, Math.min(window.innerHeight * 0.7, startHeight + delta));
+      const newHeight = Math.max(80, Math.min(window.innerHeight * 0.95, startHeight + delta));
       panel.style.height = `${newHeight}px`;
     };
     const onUp = (): void => {
@@ -1042,6 +1086,105 @@ function attachEvents(): void {
     };
     document.addEventListener("pointermove", onMove as EventListener);
     document.addEventListener("pointerup", onUp);
+  });
+
+  elements.searchResults.addEventListener("dblclick", (event) => {
+    const index = (event.target as HTMLElement).closest<HTMLElement>("[data-result-index]")?.dataset.resultIndex;
+    if (index !== undefined) jumpToSearchResult(Number(index));
+  });
+
+  elements.searchResults.addEventListener("click", (event) => {
+    const btn = (event.target as HTMLElement).closest<HTMLElement>(".zip-load-more-file");
+    if (!btn) return;
+    event.stopPropagation();
+    event.preventDefault();
+    const path = btn.dataset.zipLoadMorePath;
+    const shown = Number(btn.dataset.zipLoadMoreShown || 0);
+    if (!path) return;
+    btn.textContent = "Loading...";
+    btn.setAttribute("disabled", "");
+    searchSingleZipFile(path, state.search.query, state.search.matchCase, state.search.regex, shown, 500).then((newHits) => {
+      const group = btn.closest(".result-file-group");
+      if (!group) return;
+      group.setAttribute("open", "");
+      const tab = activeTab();
+      for (const item of newHits) {
+        const idx = searchResults.length;
+        searchResults.push({ tabId: tab.id, from: item.from, to: item.to, line: item.line, column: item.column, preview: item.preview, zipPath: item.path });
+        const div = document.createElement("div");
+        div.className = "result-item";
+        div.dataset.resultIndex = String(idx);
+        div.innerHTML = `<span class="result-location">Ln ${item.line}, Col ${item.column}</span><span class="result-preview">${escapeHtml(item.preview)}</span>`;
+        group.appendChild(div);
+      }
+      const newShown = shown + newHits.length;
+      const summary = group.querySelector(".result-file-header");
+      const totalMatch = summary?.textContent?.match(/of (\d+)/);
+      const fileTotal = totalMatch ? Number(totalMatch[1]) : newShown;
+      if (newShown >= fileTotal || newHits.length === 0) {
+        btn.remove();
+        if (summary) summary.textContent = `${path} (${newShown} of ${fileTotal})`;
+      } else {
+        btn.dataset.zipLoadMoreShown = String(newShown);
+        btn.textContent = `Load more (${fileTotal - newShown} remaining)`;
+        btn.removeAttribute("disabled");
+        if (summary) summary.innerHTML = `${escapeHtml(path)} (${newShown} of ${fileTotal})`;
+        summary?.appendChild(btn);
+      }
+    });
+  });
+
+  elements.searchResults.addEventListener("click", (event) => {
+    const btn = (event.target as HTMLElement).closest<HTMLElement>(".tab-load-more-file");
+    if (!btn) return;
+    event.stopPropagation();
+    event.preventDefault();
+    const tabId = btn.dataset.tabLoadMoreId;
+    const shown = Number(btn.dataset.tabLoadMoreShown || 0);
+    if (!tabId) return;
+    const tab = state.tabs.find(t => t.id === tabId);
+    if (!tab) return;
+    btn.textContent = "Loading...";
+    btn.setAttribute("disabled", "");
+    const ranges = rangesInText(tab.content, 500, shown);
+    const group = btn.closest(".result-file-group");
+    if (!group) return;
+    group.setAttribute("open", "");
+    for (const range of ranges) {
+      const result = rangeToSearchResult(tab, tab.content, range);
+      const idx = searchResults.length;
+      searchResults.push(result);
+      const div = document.createElement("div");
+      div.className = "result-item";
+      div.dataset.resultIndex = String(idx);
+      div.innerHTML = `<span class="result-location">Ln ${result.line}, Col ${result.column}</span><span class="result-preview">${escapeHtml(result.preview)}</span>`;
+      group.appendChild(div);
+    }
+    const newShown = shown + ranges.length;
+    const tabTotal = countRangesInText(tab.content);
+    const summary = group.querySelector(".result-file-header");
+    const displayName = isZipTab(tab) && zipExplorerView?.selectedPath ? zipExplorerView.selectedPath : tab.name;
+    if (newShown >= tabTotal || ranges.length === 0) {
+      btn.remove();
+      if (summary) summary.innerHTML = `<span>${escapeHtml(displayName)} (${newShown} of ${tabTotal} hits)</span>`;
+    } else {
+      btn.dataset.tabLoadMoreShown = String(newShown);
+      btn.textContent = `Load more (${tabTotal - newShown} remaining)`;
+      btn.removeAttribute("disabled");
+      const span = summary?.querySelector("span");
+      if (span) span.textContent = `${displayName} (${newShown} of ${tabTotal} hits)`;
+    }
+  });
+
+  elements.searchResults.addEventListener("keydown", (event) => {
+    if ((event.metaKey || event.ctrlKey) && event.key === "a") {
+      event.preventDefault();
+      const sel = window.getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(elements.searchResults);
+      sel?.removeAllRanges();
+      sel?.addRange(range);
+    }
   });
 
   document.querySelector<HTMLElement>(".output-panel-resize")?.addEventListener("pointerdown", (event) => {
@@ -1225,8 +1368,14 @@ async function handleAction(action: string): Promise<void> {
     case "diff":
       openDiffDialog();
       break;
+    case "draw":
+      openDrawTab();
+      break;
     case "http-client":
       openHttpClientTab();
+      break;
+    case "zip-explorer":
+      openZipExplorerTab();
       break;
     case "close":
       closeActiveTab();
@@ -1321,7 +1470,9 @@ function commandDefinitions(): CommandDefinition[] {
     { id: "flatten-json", label: "Flatten JSON", hint: "Tools", run: () => flattenJson() },
     { id: "go-to-line", label: "Go to Line", hint: "Cmd/Ctrl+G", run: () => goToLine() },
     { id: "diff", label: "Open Diff", hint: "Tools", run: () => openDiffDialog() },
+    { id: "draw", label: "Open Draw", hint: "Tools", run: () => openDrawTab() },
     { id: "http-client", label: "Open HTTP Client", hint: "Tools", run: () => openHttpClientTab() },
+    { id: "zip-explorer", label: "Open Zip Explorer", hint: "Tools", run: () => openZipExplorerTab() },
     { id: "split", label: splitTabForView() ? "Close Split Editor" : "Open Split Editor", hint: "View", run: () => toggleSplitEditor() },
     { id: "wrap", label: state.wrap ? "Disable Word Wrap" : "Enable Word Wrap", hint: "View", run: () => toggleWrap() },
     {
@@ -1454,7 +1605,7 @@ function newTab(content = "", name?: string, handle?: FileHandle): void {
   const id = crypto.randomUUID();
   const tab: DocumentTab = {
     id,
-    name: name ?? nextUntitledName(),
+    name: name ?? nextUntitledName(state.tabs.map((t) => t.name)),
     content,
     savedContent: content,
     language: inferLanguage(name ?? "txt"),
@@ -1505,6 +1656,15 @@ function closeTab(tabId: string): void {
 
   const index = state.tabs.findIndex((t) => t.id === tabId);
   state.tabs.splice(index, 1);
+
+  if (!elements.searchPanel.hidden) {
+    if (isZipTab(tab) || (isTextTab(tab) && textTabs().length === 0)) {
+      closeSearchPanel();
+    } else if (isTextTab(tab)) {
+      elements.searchPanel.style.height = "";
+      findAll();
+    }
+  }
   if (state.activeId === tabId) {
     state.activeId = state.tabs.length > 0 ? state.tabs[Math.max(0, index - 1)].id : "";
   }
@@ -1931,8 +2091,20 @@ function isHttpTab(tab: DocumentTab): boolean {
   return tab.kind === "http";
 }
 
+function isZipTab(tab: DocumentTab): boolean {
+  return tab.kind === "zip";
+}
+
+function isDrawTab(tab: DocumentTab): boolean {
+  return tab.kind === "draw";
+}
+
+function activeEditorView(): EditorView | undefined {
+  return editorView ?? zipExplorerView?.editor;
+}
+
 function isTextTab(tab: DocumentTab): boolean {
-  return !isDiffTab(tab) && !isHttpTab(tab);
+  return !isDiffTab(tab) && !isHttpTab(tab) && !isZipTab(tab) && !isDrawTab(tab);
 }
 
 function textTabs(): DocumentTab[] {
@@ -2113,6 +2285,8 @@ function toggleTheme(): void {
   document.documentElement.dataset.theme = state.theme;
   editorView?.dispatch({ effects: themeCompartment.reconfigure(editorTheme(state.theme, state.fontSize)) });
   splitEditorView?.dispatch({ effects: splitThemeCompartment.reconfigure(editorTheme(state.theme, state.fontSize)) });
+  zipExplorerView?.updateTheme(state.theme);
+  drawView?.refreshTheme();
   render();
 }
 
@@ -2120,6 +2294,8 @@ function openFindDialog(mode: SearchMode): void {
   searchMode = mode;
   renderFindMode();
   elements.findDialog.hidden = false;
+  const zipScopeEl = document.querySelector<HTMLElement>(".zip-scope-option");
+  if (zipScopeEl) zipScopeEl.hidden = !hasActiveTab() || !isZipTab(activeTab());
   positionFindDialog();
   window.setTimeout(() => {
     elements.findInput.focus();
@@ -2203,6 +2379,45 @@ function renderHttpClientTab(tab: DocumentTab): void {
     onDownload: downloadText,
   });
   httpClientView.render();
+}
+
+function openZipExplorerTab(): void {
+  captureActiveEditor();
+  captureSplitEditor();
+  const id = crypto.randomUUID();
+  const tab: DocumentTab = { id, name: "Zip Explorer", content: "", savedContent: "", language: "plaintext", lineEnding: "LF", kind: "zip" };
+  state.tabs.push(tab);
+  state.activeId = id;
+  mountEditor();
+  render();
+}
+
+function renderZipExplorerTab(): void {
+  if (!zipExplorerView) {
+    zipExplorerView = new ZipExplorerView(elements.zipExplorerView, {
+      onChange: () => { persistSession(); renderStatus(); },
+      onNotify: notify,
+    });
+    zipExplorerView.render();
+  }
+}
+
+function openDrawTab(): void {
+  captureActiveEditor();
+  captureSplitEditor();
+  const id = crypto.randomUUID();
+  const tab: DocumentTab = { id, name: "Draw", content: "", savedContent: "", language: "plaintext", lineEnding: "LF", kind: "draw" };
+  state.tabs.push(tab);
+  state.activeId = id;
+  mountEditor();
+  render();
+}
+
+function renderDrawTab(): void {
+  if (!drawView) {
+    drawView = new DrawView(elements.drawView);
+    drawView.render();
+  }
 }
 
 function positionFindDialog(): void {
@@ -2562,11 +2777,13 @@ function createDiffPreview(value: string): string {
 }
 
 function currentSearchScope(): SearchScope {
-  return document.querySelector<HTMLInputElement>('input[name="searchScope"]:checked')?.value === "all" ? "all" : "current";
+  const val = document.querySelector<HTMLInputElement>('input[name="searchScope"]:checked')?.value;
+  return val === "all" ? "all" : val === "zip" ? "zip" : "current";
 }
 
 function findText(direction: 1 | -1): void {
-  if (!editorView) {
+  const ev = activeEditorView();
+  if (!ev) {
     return;
   }
 
@@ -2581,11 +2798,11 @@ function findText(direction: 1 | -1): void {
     return;
   }
 
-  editorView.dispatch({
+  ev.dispatch({
     selection: { anchor: result.from, head: result.to },
     scrollIntoView: true,
   });
-  editorView.focus();
+  ev.focus();
   setSearchMessage(`Match at ${result.from + 1}.`);
 }
 
@@ -2621,12 +2838,111 @@ function findAcrossTabs(direction: 1 | -1): void {
 function findAll(): void {
   captureActiveEditor();
   searchResultsVisiblePerFileLimit = SEARCH_RESULTS_PAGE_SIZE;
+  if (currentSearchScope() === "zip") {
+    findAllInZip();
+    return;
+  }
+  if (currentSearchScope() === "all" && hasActiveTab() && isZipTab(activeTab()) && zipExplorerView) {
+    findAllInOpenZipTabs();
+    return;
+  }
   const resultSet =
     currentSearchScope() === "all"
       ? collectSearchResults(searchResultsVisiblePerFileLimit)
       : collectCurrentSearchResults(searchResultsVisiblePerFileLimit);
   renderSearchResults(resultSet);
   setSearchMessage(searchResultMessage(resultSet));
+}
+
+function findAllInOpenZipTabs(): void {
+  if (!state.search.query || !zipExplorerView) { setSearchMessage("Enter search text."); return; }
+  const tabs = zipExplorerView.tabs;
+  if (tabs.length === 0) { setSearchMessage("No open files in zip explorer."); return; }
+  const fragment = document.createDocumentFragment();
+  searchResults = [];
+  const mainTab = activeTab();
+  let totalHits = 0;
+  let shownHits = 0;
+  for (const zt of tabs) {
+    const ranges = rangesInText(zt.content, searchResultsVisiblePerFileLimit);
+    const total = countRangesInText(zt.content);
+    totalHits += total;
+    if (total === 0) continue;
+    shownHits += ranges.length;
+    const group = document.createElement("details");
+    group.className = "result-file-group";
+    group.open = true;
+    group.innerHTML = `<summary class="result-file-header">${escapeHtml(zt.path)} (${ranges.length} of ${total} hits)</summary>`;
+    for (const range of ranges) {
+      const idx = searchResults.length;
+      const before = zt.content.slice(0, range.from);
+      const line = before.split("\n").length;
+      const lineStart = before.lastIndexOf("\n") + 1;
+      const lineEnd = zt.content.indexOf("\n", range.from);
+      const preview = zt.content.slice(lineStart, lineEnd === -1 ? zt.content.length : lineEnd).trim() || "(blank line)";
+      searchResults.push({ tabId: mainTab.id, from: range.from, to: range.to, line, column: range.from - lineStart + 1, preview, zipPath: zt.path });
+      const div = document.createElement("div");
+      div.className = "result-item";
+      div.dataset.resultIndex = String(idx);
+      div.innerHTML = `<span class="result-location">Ln ${line}, Col ${range.from - lineStart + 1}</span><span class="result-preview">${escapeHtml(preview)}</span>`;
+      group.appendChild(div);
+    }
+    fragment.appendChild(group);
+  }
+  if (shownHits < totalHits) {
+    const footer = document.createElement("div");
+    footer.className = "empty-results";
+    footer.textContent = `Showing ${shownHits} of ${totalHits} matches.`;
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "mini-button";
+    button.dataset.action = "load-more-search-results";
+    button.textContent = "Load more per file";
+    footer.append(" ", button);
+    fragment.appendChild(footer);
+  }
+  elements.searchResults.replaceChildren(fragment);
+  elements.searchPanel.hidden = false;
+  setSearchMessage(`${totalHits} match${totalHits === 1 ? "" : "es"} in ${tabs.length} open file${tabs.length === 1 ? "" : "s"}.`);
+}
+
+async function findAllInZip(): Promise<void> {
+  if (!state.search.query) { setSearchMessage("Enter search text."); return; }
+  elements.findDialog.classList.add("find-dialog-loading");
+  setSearchMessage("Searching zip...");
+  try {
+    const { hits, totals } = await searchAllZipFiles(state.search.query, state.search.matchCase, state.search.regex, 100);
+    if (hits.length === 0) { setSearchMessage("No matches in zip."); elements.searchResults.replaceChildren(); return; }
+  elements.searchPanel.hidden = false;
+  const fragment = document.createDocumentFragment();
+  const grouped = new Map<string, typeof hits>();
+  for (const h of hits) { const arr = grouped.get(h.path) ?? []; arr.push(h); grouped.set(h.path, arr); }
+  searchResults = [];
+  const tab = activeTab();
+  let totalMatches = 0;
+  for (const [path, items] of grouped) {
+    const fileTotal = totals.get(path) ?? items.length;
+    totalMatches += fileTotal;
+    const group = document.createElement("details");
+    group.className = "result-file-group";
+    group.open = true;
+    group.innerHTML = `<summary class="result-file-header">${escapeHtml(path)} (${items.length} of ${fileTotal})${items.length < fileTotal ? `<button type="button" class="mini-button zip-load-more-file" data-zip-load-more-path="${escapeHtml(path)}" data-zip-load-more-shown="${items.length}">Load more (${fileTotal - items.length} remaining)</button>` : ""}</summary>`;
+    for (const item of items) {
+      const idx = searchResults.length;
+      searchResults.push({ tabId: tab.id, from: item.from, to: item.to, line: item.line, column: item.column, preview: item.preview, zipPath: item.path });
+      const div = document.createElement("div");
+      div.className = "result-item";
+      div.dataset.resultIndex = String(idx);
+      div.innerHTML = `<span class="result-location">Ln ${item.line}, Col ${item.column}</span><span class="result-preview">${escapeHtml(item.preview)}</span>`;
+      group.appendChild(div);
+    }
+    fragment.appendChild(group);
+  }
+  elements.searchResults.replaceChildren(fragment);
+  setSearchMessage(`${totalMatches} match${totalMatches === 1 ? "" : "es"} in ${grouped.size} file${grouped.size === 1 ? "" : "s"}.`);
+  } finally {
+    elements.findDialog.classList.remove("find-dialog-loading");
+  }
 }
 
 function replaceOne(): void {
@@ -2699,7 +3015,8 @@ function replaceAllInTabs(): void {
 }
 
 function findRange(direction: 1 | -1): { from: number; to: number; text: string } | undefined {
-  if (!editorView || !state.search.query) {
+  const ev = activeEditorView();
+  if (!ev || !state.search.query) {
     return undefined;
   }
 
@@ -2708,7 +3025,7 @@ function findRange(direction: 1 | -1): { from: number; to: number; text: string 
     return undefined;
   }
 
-  const cursor = direction === 1 ? editorView.state.selection.main.to : editorView.state.selection.main.from;
+  const cursor = direction === 1 ? ev.state.selection.main.to : ev.state.selection.main.from;
   if (direction === 1) {
     return ranges.find((range) => range.from >= cursor) ?? ranges[0];
   }
@@ -2716,14 +3033,15 @@ function findRange(direction: 1 | -1): { from: number; to: number; text: string 
 }
 
 function allRanges(): SearchRange[] {
-  if (!editorView || !state.search.query) {
+  const ev = activeEditorView();
+  if (!ev || !state.search.query) {
     return [];
   }
 
-  return rangesInText(editorView.state.doc.toString());
+  return rangesInText(ev.state.doc.toString());
 }
 
-function rangesInText(text: string, limit = Number.POSITIVE_INFINITY): SearchRange[] {
+function rangesInText(text: string, limit = Number.POSITIVE_INFINITY, skip = 0): SearchRange[] {
   if (!state.search.query) {
     return [];
   }
@@ -2734,7 +3052,10 @@ function rangesInText(text: string, limit = Number.POSITIVE_INFINITY): SearchRan
       const regex = new RegExp(state.search.query, flags);
       const ranges: SearchRange[] = [];
       let match: RegExpExecArray | null;
-      while (ranges.length < limit && (match = regex.exec(text))) {
+      let skipped = 0;
+      while ((match = regex.exec(text))) {
+        if (skipped < skip) { skipped++; if (match[0].length === 0) regex.lastIndex += 1; continue; }
+        if (ranges.length >= limit) break;
         ranges.push({ from: match.index, to: match.index + match[0].length, text: match[0], match });
         if (match[0].length === 0) {
           regex.lastIndex += 1;
@@ -2751,7 +3072,10 @@ function rangesInText(text: string, limit = Number.POSITIVE_INFINITY): SearchRan
   const needle = state.search.matchCase ? state.search.query : state.search.query.toLowerCase();
   const ranges: SearchRange[] = [];
   let index = haystack.indexOf(needle);
-  while (index !== -1 && ranges.length < limit) {
+  let skipped = 0;
+  while (index !== -1) {
+    if (skipped < skip) { skipped++; index = haystack.indexOf(needle, index + Math.max(needle.length, 1)); continue; }
+    if (ranges.length >= limit) break;
     ranges.push({ from: index, to: index + needle.length, text: text.slice(index, index + needle.length) });
     index = haystack.indexOf(needle, index + Math.max(needle.length, 1));
   }
@@ -2803,7 +3127,7 @@ function replaceRangesInText(text: string, ranges: SearchRange[]): string {
 
 function collectCurrentSearchResults(limit: number): SearchResultSet {
   const tab = activeTab();
-  const text = editorView?.state.doc.toString() ?? tab.content;
+  const text = activeEditorView()?.state.doc.toString() ?? tab.content;
   const total = countRangesInText(text);
   const ranges = rangesInText(text, limit);
   const perTabCounts = new Map<string, number>([[tab.id, total]]);
@@ -2856,21 +3180,9 @@ function rangeToSearchResult(
   };
 }
 
-function createSearchPreview(text: string, lineStart: number, lineEnd: number, matchFrom: number, matchTo: number): string {
-  const maxLength = 220;
-  const lineLength = lineEnd - lineStart;
-
-  if (lineLength <= maxLength) {
-    return text.slice(lineStart, lineEnd).trim() || "(blank line)";
-  }
-
-  const matchMidpoint = Math.round((matchFrom + matchTo) / 2);
-  const previewStart = Math.max(lineStart, matchMidpoint - Math.round(maxLength / 2));
-  const previewEnd = Math.min(lineEnd, previewStart + maxLength);
-  const adjustedStart = Math.max(lineStart, previewEnd - maxLength);
-  const prefix = adjustedStart > lineStart ? "... " : "";
-  const suffix = previewEnd < lineEnd ? " ..." : "";
-  return `${prefix}${text.slice(adjustedStart, previewEnd).trim()}${suffix}`;
+function createSearchPreview(text: string, lineStart: number, lineEnd: number, _matchFrom: number, _matchTo: number): string {
+  const line = text.slice(lineStart, lineEnd).trim();
+  return line || "(blank line)";
 }
 
 function closeSearchPanel(): void {
@@ -2896,7 +3208,7 @@ function renderSearchResults(resultSet: SearchResultSet): void {
     grouped.set(result.tabId, list);
   });
 
-  const matchingTabs = textTabs().filter((tab) => (perTabCounts.get(tab.id) ?? 0) > 0);
+  const matchingTabs = state.tabs.filter((tab) => (perTabCounts.get(tab.id) ?? 0) > 0);
   const fragment = document.createDocumentFragment();
   for (const tab of matchingTabs) {
     const items = grouped.get(tab.id) ?? [];
@@ -2906,11 +3218,20 @@ function renderSearchResults(resultSet: SearchResultSet): void {
     group.open = true;
     const header = document.createElement("summary");
     header.className = "result-file-header";
-    header.textContent = `${tab.name} (${items.length} of ${tabTotal} hits)`;
+    const displayName = isZipTab(tab) && zipExplorerView?.selectedPath ? zipExplorerView.selectedPath : tab.name;
+    header.innerHTML = `<span>${escapeHtml(displayName)} (${items.length} of ${tabTotal} hits)</span>`;
+    if (items.length < tabTotal) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "mini-button tab-load-more-file";
+      btn.dataset.tabLoadMoreId = tab.id;
+      btn.dataset.tabLoadMoreShown = String(items.length);
+      btn.textContent = `Load more (${tabTotal - items.length} remaining)`;
+      header.appendChild(btn);
+    }
     group.appendChild(header);
     for (const { index, result } of items) {
-      const button = document.createElement("button");
-      button.type = "button";
+      const button = document.createElement("div");
       button.className = "result-item";
       button.dataset.resultIndex = String(index);
       button.innerHTML = `
@@ -2923,24 +3244,6 @@ function renderSearchResults(resultSet: SearchResultSet): void {
   }
   elements.searchResults.replaceChildren(fragment);
 
-  if (results.length < total) {
-    const footer = document.createElement("div");
-    footer.className = "empty-results";
-    footer.textContent = `Showing ${results.length} of ${total} matches.`;
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "mini-button";
-    button.dataset.action = "load-more-search-results";
-    button.textContent = currentSearchScope() === "all" ? "Load more per file" : "Load more";
-    footer.append(" ", button);
-    elements.searchResults.append(footer);
-  } else if (total > SEARCH_RESULTS_PAGE_SIZE) {
-    const note = document.createElement("div");
-    note.className = "empty-results";
-    note.textContent = `Showing all ${total} matches.`;
-    elements.searchResults.append(note);
-  }
-
   elements.searchPanel.hidden = false;
 }
 
@@ -2951,6 +3254,13 @@ function searchResultMessage(resultSet: SearchResultSet): string {
 
 function loadMoreSearchResults(): void {
   searchResultsVisiblePerFileLimit += SEARCH_RESULTS_PAGE_SIZE;
+  if (currentSearchScope() === "zip") {
+    return;
+  }
+  if (currentSearchScope() === "all" && hasActiveTab() && isZipTab(activeTab()) && zipExplorerView) {
+    findAllInOpenZipTabs();
+    return;
+  }
   const resultSet =
     currentSearchScope() === "all"
       ? collectSearchResults(searchResultsVisiblePerFileLimit)
@@ -2965,15 +3275,25 @@ function jumpToSearchResult(index: number): void {
     return;
   }
 
+  if (result.zipPath && zipExplorerView) {
+    zipExplorerView.openFile(result.zipPath).then(() => {
+      const ev = zipExplorerView?.editor;
+      ev?.dispatch({ selection: { anchor: result.from, head: result.to }, scrollIntoView: true });
+      ev?.focus();
+    });
+    return;
+  }
+
   if (result.tabId !== state.activeId) {
     switchToTab(result.tabId);
   }
 
-  editorView?.dispatch({
+  const ev = activeEditorView();
+  ev?.dispatch({
     selection: { anchor: result.from, head: result.to },
     scrollIntoView: true,
   });
-  editorView?.focus();
+  ev?.focus();
 }
 
 function matchesQuery(value: string): boolean {
@@ -3005,19 +3325,6 @@ function replacementFor(range: SearchRange): string {
   } catch {
     return state.search.replacement;
   }
-}
-
-function nextUntitledName(): string {
-  let index = 1;
-  const names = new Set(state.tabs.map((tab) => tab.name));
-  while (names.has(`new${index}.txt`)) {
-    index += 1;
-  }
-  return `new${index}.txt`;
-}
-
-function inferLineEnding(content: string): LineEnding {
-  return content.includes("\r\n") ? "CRLF" : "LF";
 }
 
 function suggestedSaveName(tab: DocumentTab): string {
@@ -3084,14 +3391,6 @@ function setSearchMessage(message: string): void {
       elements.searchMessage.textContent = "";
     }
   }, 3000);
-}
-
-function escapeHtml(value: string): string {
-  return value
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;");
 }
 
 // --- Code Runner ---

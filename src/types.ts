@@ -18,7 +18,7 @@ export type LanguageId =
 export type ThemeId = "light" | "dark";
 
 export type LineEnding = "LF" | "CRLF";
-export type SearchScope = "current" | "all";
+export type SearchScope = "current" | "all" | "zip";
 export type SearchMode = "find" | "replace";
 export type DiffKind = "equal" | "insert" | "delete" | "change";
 
@@ -59,7 +59,7 @@ export interface DocumentTab {
   savedContent: string;
   language: LanguageId;
   lineEnding: LineEnding;
-  kind?: "text" | "diff" | "http";
+  kind?: "text" | "diff" | "http" | "zip" | "draw";
   diff?: DiffState;
   http?: HttpClientState;
   handle?: FileHandle;

@@ -6,6 +6,7 @@ const POSTMAN_SCHEMA = "https://schema.getpostman.com/json/collection/v2.1.0/col
 type PostmanItem = {
   name?: string;
   item?: PostmanItem[];
+  event?: Array<{ listen?: string; script?: { exec?: string[] | string } }>;
   request?: {
     method?: string;
     url?: string | { raw?: string; query?: Array<{ key?: string; value?: string; disabled?: boolean }> };
@@ -65,6 +66,7 @@ function importPostmanItem(item: PostmanItem): HttpFolder | HttpRequestItem {
   request.params = queryRowsFromPostmanUrl(item.request?.url);
   request.auth = authFromPostman(item.request?.auth);
   request.body = bodyFromPostman(item.request?.body);
+  request.scripts = scriptsFromPostman(item.event);
   return request;
 }
 
@@ -85,6 +87,7 @@ function exportPostmanItem(item: HttpFolder | HttpRequestItem): unknown {
       auth: exportAuth(item.auth),
       body: exportBody(item.body),
     },
+    event: exportScripts(item),
   };
 }
 
@@ -126,6 +129,18 @@ function bodyFromPostman(body: PostmanBody): HttpBody {
   if (body.mode === "urlencoded") return { mode: "form-urlencoded", raw: "", form: rowsFromPostman(body.urlencoded) };
   if (body.mode === "formdata") return { mode: "multipart", raw: "", form: rowsFromPostman(body.formdata) };
   return { mode: "none", raw: "", form: [createRow()] };
+}
+
+function scriptsFromPostman(events: PostmanItem["event"]): HttpRequestItem["scripts"] {
+  const scriptFor = (listen: string): string => {
+    const event = events?.find((candidate) => candidate.listen === listen);
+    const exec = event?.script?.exec;
+    return Array.isArray(exec) ? exec.join("\n") : typeof exec === "string" ? exec : "";
+  };
+  return {
+    preRequest: scriptFor("prerequest"),
+    test: scriptFor("test"),
+  };
 }
 
 function exportUrl(request: HttpRequestItem): unknown {
@@ -183,6 +198,17 @@ function exportBody(body: HttpBody): unknown {
     return { mode: "formdata", formdata: enabledRows(body.form).map((row) => ({ key: row.key, value: row.value, type: "text" })) };
   }
   return undefined;
+}
+
+function exportScripts(request: HttpRequestItem): unknown[] | undefined {
+  const events = [];
+  if (request.scripts.preRequest.trim()) {
+    events.push({ listen: "prerequest", script: { type: "text/javascript", exec: request.scripts.preRequest.split("\n") } });
+  }
+  if (request.scripts.test.trim()) {
+    events.push({ listen: "test", script: { type: "text/javascript", exec: request.scripts.test.split("\n") } });
+  }
+  return events.length ? events : undefined;
 }
 
 function enabledRows(rows: KeyValueRow[]): KeyValueRow[] {

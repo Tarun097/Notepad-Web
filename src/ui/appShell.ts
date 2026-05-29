@@ -22,7 +22,9 @@ export function renderAppShell(app: HTMLElement): void {
           <div class="dropdown-menu" id="toolsMenu" hidden>
             <div class="dropdown-item has-submenu" data-tools-action="show-json">JSON ▸</div>
             <div class="dropdown-item" data-tools-action="diff">Diff</div>
+            <div class="dropdown-item" data-tools-action="draw">Draw</div>
             <div class="dropdown-item" data-tools-action="http-client">HTTP Client</div>
+            <div class="dropdown-item" data-tools-action="zip-explorer">Zip Explorer</div>
           </div>
         </div>
         <button class="tool-button" data-action="run-code" id="runCodeBtn" title="Run code (Java/C++/C#)" hidden>&#9654; Run</button>
@@ -82,13 +84,15 @@ export function renderAppShell(app: HTMLElement): void {
           </div>
         </div>
         <div id="httpClientView" class="http-client-tab-view" aria-label="HTTP client" hidden></div>
+        <div id="zipExplorerView" class="zip-explorer-tab-view" aria-label="Zip explorer" hidden></div>
+        <div id="drawView" class="draw-tab-view" aria-label="Draw" hidden></div>
         <div id="searchPanel" class="search-panel" hidden>
           <div class="search-panel-resize" data-action="resize-search-panel"></div>
           <div class="search-panel-header">
             <span class="search-panel-title">Search Results</span>
             <button class="icon-button" data-action="close-search-panel" title="Close">x</button>
           </div>
-          <div id="searchResults" class="search-results" aria-live="polite"></div>
+          <div id="searchResults" class="search-results" aria-live="polite" tabindex="0"></div>
         </div>
         <div id="outputPanel" class="output-panel" hidden>
           <div class="output-panel-resize" data-action="resize-output-panel"></div>
@@ -138,6 +142,7 @@ export function renderAppShell(app: HTMLElement): void {
             <legend>Scope</legend>
             <label class="radio-control"><input name="searchScope" type="radio" value="current" checked /> Current file</label>
             <label class="radio-control"><input name="searchScope" type="radio" value="all" /> All open files</label>
+            <label class="radio-control zip-scope-option" hidden><input name="searchScope" type="radio" value="zip" /> All zip files</label>
           </fieldset>
 
           <div class="dialog-options">

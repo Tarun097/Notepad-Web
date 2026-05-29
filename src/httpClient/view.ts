@@ -1,15 +1,19 @@
-import { formatResponseBody, sendHttpRequest } from "./client";
+import { buildRequestUrl, formatResponseBody, sendHttpRequest } from "./client";
+import { formatRequestJson } from "./jsonBody";
 import { exportPostmanCollection, importPostmanCollection } from "./postman";
 import {
   activeEnvironment,
   cloneRequest,
   createCollection,
+  createEnvironment,
   createRequest,
   createRow,
   clampResponseHeight,
   clampResponseWidth,
+  contentTypeForBodyMode,
   findRequest,
   flattenRequests,
+  isAutoContentType,
   persistHttpWorkspace,
   upsertRequest,
   variablesForEnvironment,
@@ -21,6 +25,8 @@ import {
   HttpEnvironment,
   HttpMethod,
   HttpRequestItem,
+  HttpResponse,
+  HttpTestResult,
   KeyValueRow,
   isHttpFolder,
 } from "./types";
@@ -29,6 +35,7 @@ const METHODS: HttpMethod[] = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", 
 
 export class HttpClientView {
   private readonly fileInput: HTMLInputElement;
+  private _envVarRenderTimer = 0;
 
   constructor(
     private readonly root: HTMLElement,
@@ -50,6 +57,7 @@ export class HttpClientView {
   render(): void {
     this.root.className = "http-client-view";
     this.state.ui ??= { historyVisible: false, responseWidth: 50, responseHeight: 52, requestPanel: "params", responsePanel: "body" };
+    const sidebarOpenStates = Array.from(this.root.querySelectorAll<HTMLDetailsElement>(".http-sidebar-section")).map((d) => d.open);
     this.root.classList.toggle("history-hidden", !this.state.ui.historyVisible);
     this.root.style.setProperty("--http-response-width", `${this.state.ui.responseWidth}%`);
     this.root.style.setProperty("--http-response-height", `${this.state.ui.responseHeight}%`);
@@ -57,7 +65,7 @@ export class HttpClientView {
     const response = this.state.response;
     this.root.innerHTML = `
       <aside class="http-sidebar">
-        <details class="http-sidebar-section" open>
+        <details class="http-sidebar-section">
           <summary>COLLECTIONS <button class="mini-button" data-http-action="new-collection" title="New Collection">+</button><button class="mini-button" data-http-action="import-postman" title="Import">⌁</button></summary>
           <div class="http-collection-list">${this.renderCollections()}</div>
         </details>
@@ -66,7 +74,8 @@ export class HttpClientView {
           <div class="http-env-panel">
             <div class="http-sidebar-actions">
               ${this.renderEnvironmentPicker()}
-              <button class="mini-button" data-http-action="add-env-row">Add</button>
+              <button class="mini-button" data-http-action="add-environment" title="New Environment">+</button>
+              <button class="mini-button" data-http-action="add-env-row">Add Variable</button>
             </div>
             ${this.renderEnvironmentRows()}
           </div>
@@ -79,11 +88,12 @@ export class HttpClientView {
           </div>
         </details>
       </aside>
+      <div class="http-sidebar-resize" data-http-resize="sidebar"></div>
       <section class="http-workbench">
         <div class="http-top-strip">
           ${this.renderOpenTabs(activeRequest)}
           <button class="http-plus-tab" data-http-action="new-request">+</button>
-          <div class="http-env-top">${this.renderEnvironmentPicker()}</div>
+          <div class="http-env-top"><select data-http-field="environment" class="http-env-select">${this.state.environments.map((e) => `<option value="${e.id}" ${e.id === this.state.activeEnvironmentId ? "selected" : ""}>${escapeHtml(e.name)}</option>`).join("")}</select></div>
         </div>
         ${this.hasOpenTabs() ? `<div class="http-title-row">
           <span class="http-protocol-badge">HTTP</span>
@@ -92,7 +102,7 @@ export class HttpClientView {
         </div>
         <div class="http-request-bar">
           <select data-http-field="method">${METHODS.map((method) => `<option value="${method}" ${method === activeRequest.method ? "selected" : ""}>${method}</option>`).join("")}</select>
-          <input class="http-url-input" data-http-field="url" value="${escapeAttr(activeRequest.url)}" spellcheck="false" />
+          <div class="http-url-container">${this.renderUrlBackdrop(activeRequest)}<input class="http-url-input" data-http-field="url" value="${escapeAttr(activeRequest.url)}" spellcheck="false" />${this.renderUrlVarPopover(activeRequest)}</div>
           <button class="mini-button primary" data-http-action="send">Send</button>
         </div>
         <div class="http-main-split">
@@ -102,9 +112,9 @@ export class HttpClientView {
               ${this.renderRequestTab("auth", "Authorization")}
               ${this.renderRequestTab("headers", `Headers ${activeRequest.headers.filter((row) => row.enabled && row.key).length || ""}`)}
               ${this.renderRequestTab("body", "Body")}
+              ${this.renderRequestTab("cookies", `Cookies ${activeRequest.cookies.filter((row) => row.enabled && row.key).length || ""}`)}
               ${this.renderRequestTab("scripts", "Scripts")}
               ${this.renderRequestTab("settings", "Settings")}
-              <a>Cookies</a>
             </div>
             <div class="http-request-panel">${this.renderActiveRequestPanel(activeRequest)}</div>
           </section>
@@ -119,7 +129,7 @@ export class HttpClientView {
               </div>
               ${
                 response
-                  ? `<div class="http-response-stats"><span class="status-ok">${response.status} ${escapeHtml(response.statusText)}</span><span>${response.durationMs} ms</span><span>${formatBytes(response.sizeBytes)}</span></div>`
+                  ? `<div class="http-response-stats"><span class="${response.status > 0 && response.status < 400 ? "status-ok" : "status-err"}">${response.status || "ERR"} ${escapeHtml(response.statusText)}</span>${response.durationMs ? `<span>${response.durationMs} ms</span><span>${formatBytes(response.sizeBytes)}</span>` : ""}</div>`
                   : `<div class="http-response-stats"><span>No response yet</span></div>`
               }
             </div>
@@ -129,6 +139,9 @@ export class HttpClientView {
       </section>
     `;
     this.root.append(this.fileInput);
+    if (sidebarOpenStates.length) {
+      this.root.querySelectorAll<HTMLDetailsElement>(".http-sidebar-section").forEach((d, i) => { if (sidebarOpenStates[i] != null) d.open = sidebarOpenStates[i]; });
+    }
   }
 
   destroy(): void {
@@ -191,6 +204,7 @@ export class HttpClientView {
     this.captureCollectionNames();
     request.headers = this.captureRows("headers") ?? request.headers;
     request.params = this.captureRows("params") ?? request.params;
+    request.cookies = this.captureRows("cookies") ?? request.cookies;
     const environment = activeEnvironment(this.state);
     if (environment) environment.variables = this.captureRows("env") ?? environment.variables;
     const bodyMode = this.inputValue("[data-http-field='body-mode']");
@@ -198,6 +212,10 @@ export class HttpClientView {
     const bodyRaw = this.root.querySelector<HTMLTextAreaElement>("[data-http-field='body-raw']");
     if (bodyRaw) request.body.raw = bodyRaw.value;
     if (this.root.querySelector("[data-http-row-group='body']")) request.body.form = this.captureRows("body") ?? request.body.form;
+    const preRequestScript = this.root.querySelector<HTMLTextAreaElement>("[data-http-field='pre-request-script']");
+    if (preRequestScript) request.scripts.preRequest = preRequestScript.value;
+    const testScript = this.root.querySelector<HTMLTextAreaElement>("[data-http-field='test-script']");
+    if (testScript) request.scripts.test = testScript.value;
     const authType = this.inputValue("[data-http-field='auth-type']");
     if (authType === "bearer") {
       request.auth = { type: "bearer", token: this.inputValue("[data-http-field='auth-token']") };
@@ -222,6 +240,7 @@ export class HttpClientView {
   private async handleClick(event: Event): Promise<void> {
     const target = event.target as HTMLElement;
     const requestId = target.closest<HTMLElement>("[data-http-request]")?.dataset.httpRequest;
+    const historyId = target.closest<HTMLElement>("[data-http-history]")?.dataset.httpHistory;
     const collectionId = target.closest<HTMLElement>("[data-http-collection]")?.dataset.httpCollection;
     const action = target.closest<HTMLElement>("[data-http-action]")?.dataset.httpAction;
     const switchTab = target.closest<HTMLElement>("[data-http-switch-tab]")?.dataset.httpSwitchTab;
@@ -235,6 +254,12 @@ export class HttpClientView {
     if (action?.startsWith("delete-request:")) {
       this.captureForm();
       this.deleteRequest(action.replace("delete-request:", ""));
+      return;
+    }
+
+    if (action?.startsWith("duplicate-request:")) {
+      this.captureForm();
+      this.duplicateRequest(action.replace("duplicate-request:", ""));
       return;
     }
 
@@ -262,6 +287,12 @@ export class HttpClientView {
       return;
     }
 
+    if (historyId) {
+      this.captureForm();
+      this.restoreHistoryEntry(historyId);
+      return;
+    }
+
     if (collectionId && !action) {
       this.state.activeCollectionId = this.state.activeCollectionId === collectionId ? undefined : collectionId;
       this.persistAndRender();
@@ -276,6 +307,7 @@ export class HttpClientView {
     else if (action === "new-request") this.newRequest();
     else if (action === "new-collection") this.newCollection();
     else if (action.startsWith("add-request:")) this.newRequest(action.replace("add-request:", ""));
+    else if (action.startsWith("duplicate-request:")) this.duplicateRequest(action.replace("duplicate-request:", ""));
     else if (action.startsWith("delete-collection:")) this.deleteCollection(action.replace("delete-collection:", ""));
     else if (action.startsWith("delete-request:")) this.deleteRequest(action.replace("delete-request:", ""));
     else if (action === "import-postman") this.fileInput.click();
@@ -290,10 +322,15 @@ export class HttpClientView {
     else if (action === "format-body-json") this.formatBodyJson();
     else if (action === "add-param-row") this.state.draft.params.push(createRow());
     else if (action === "add-header-row") this.state.draft.headers.push(createRow());
+    else if (action === "add-cookie-row") this.state.draft.cookies.push(createRow());
     else if (action === "add-body-row") this.state.draft.body.form.push(createRow());
+    else if (action === "add-environment") { const env = createEnvironment(); this.state.environments.push(env); this.state.activeEnvironmentId = env.id; }
+    else if (action === "delete-environment") { this.state.environments = this.state.environments.filter((e) => e.id !== this.state.activeEnvironmentId); this.state.activeEnvironmentId = this.state.environments[0]?.id; }
     else if (action === "add-env-row") activeEnvironment(this.state)?.variables.push(createRow());
+    else if (action.startsWith("add-row-after:")) this.addRowAfter(action);
+    else if (action.startsWith("remove-row:")) this.removeRow(action);
 
-    if (!["send", "save-request", "new-request", "new-collection", "import-postman", "export-postman"].includes(action) && !action.startsWith("delete-") && !action.startsWith("close-request:") && !action.startsWith("export-collection:")) {
+    if (!["send", "save-request", "new-request", "new-collection", "import-postman", "export-postman"].includes(action) && !action.startsWith("delete-collection") && !action.startsWith("delete-request") && !action.startsWith("close-request:") && !action.startsWith("export-collection:")) {
       this.persistAndRender();
     }
   }
@@ -309,6 +346,12 @@ export class HttpClientView {
     this.root.classList.add("resizing-response");
 
     const onMove = (moveEvent: PointerEvent): void => {
+      if (resizeKind === "sidebar") {
+        const rootRect = this.root.getBoundingClientRect();
+        const width = Math.max(160, Math.min(500, moveEvent.clientX - rootRect.left));
+        this.root.style.setProperty("--http-sidebar-width", `${width}px`);
+        return;
+      }
       const split = this.root.querySelector<HTMLElement>(".http-main-split");
       if (!split) return;
       const rect = split.getBoundingClientRect();
@@ -339,10 +382,34 @@ export class HttpClientView {
 
   private handleChange(event: Event): void {
     const target = event.target as HTMLElement;
+    const envVariable = (target as HTMLInputElement).dataset.httpEnvVariable;
+    if (envVariable) {
+      this.updateEnvironmentVariable(envVariable, (target as HTMLInputElement).value);
+      this.persistAndRender();
+      return;
+    }
     if (target.matches("[data-http-field='environment']")) {
       this.captureForm();
       this.state.activeEnvironmentId = (target as HTMLSelectElement).value;
       this.persistAndRender();
+      return;
+    }
+    if (target.matches("[data-http-field='auth-type']")) {
+      this.captureForm();
+      this.persistAndRender();
+      return;
+    }
+    if (target.matches("[data-http-field='url']")) {
+      this.captureForm();
+      this.syncParamsFromUrl();
+      this.persistAndRender();
+      return;
+    }
+    if (target.closest("[data-http-row-group='params']")) {
+      this.captureForm();
+      this.syncUrlFromParams();
+      this.writeUrlInput();
+      persistHttpWorkspace(this.state);
       return;
     }
     this.captureForm();
@@ -350,10 +417,56 @@ export class HttpClientView {
   }
 
   private handleInput(event: Event): void {
-    if (!(event.target as HTMLElement).matches("input, textarea, select")) return;
+    const target = event.target as HTMLElement;
+    if (!target.matches("input, textarea, select")) return;
+    if ((target as HTMLInputElement).dataset.httpField === "env-name") {
+      const env = activeEnvironment(this.state);
+      if (env) {
+        env.name = (target as HTMLInputElement).value;
+        this.root.querySelectorAll<HTMLOptionElement>(`.http-env-select option[value="${env.id}"]`).forEach((opt) => { opt.textContent = env.name; });
+        persistHttpWorkspace(this.state);
+      }
+      return;
+    }
+    const envVariable = (target as HTMLInputElement).dataset.httpEnvVariable;
+    if (envVariable) {
+      this.updateEnvironmentVariable(envVariable, (target as HTMLInputElement).value);
+      persistHttpWorkspace(this.state);
+      this.syncUrlBackdrop();
+      clearTimeout(this._envVarRenderTimer);
+      this._envVarRenderTimer = window.setTimeout(() => { this.callbacks.onChange(); this.render(); }, 600);
+      return;
+    }
     this.captureForm();
+    if (target.closest("[data-http-row-group='params']")) {
+      this.syncUrlFromParams();
+      this.writeUrlInput();
+    }
+    if (target.matches("[data-http-field='url']") || target.closest("[data-http-row-group='params']")) {
+      this.syncUrlBackdrop();
+    }
+    if (target.closest("[data-http-row-group='env']")) {
+      this.syncUrlBackdrop();
+      this.syncUrlVarPopover();
+    }
     persistHttpWorkspace(this.state);
     this.updateDirtyDot();
+  }
+
+  private syncUrlBackdrop(): void {
+    const backdrop = this.root.querySelector(".http-url-backdrop");
+    if (!backdrop) return;
+    const request = this.activeRequest();
+    backdrop.innerHTML = this.renderUrlBackdropContent(request);
+  }
+
+  private syncUrlVarPopover(): void {
+    const oldPopover = this.root.querySelector(".http-url-var-popover");
+    if (oldPopover) oldPopover.remove();
+    const container = this.root.querySelector(".http-url-container");
+    if (!container) return;
+    const request = this.activeRequest();
+    container.insertAdjacentHTML("beforeend", this.renderUrlVarPopover(request));
   }
 
   private updateDirtyDot(): void {
@@ -378,22 +491,70 @@ export class HttpClientView {
     }
     try {
       this.callbacks.onNotify("Sending request...");
-      const response = await sendHttpRequest(request, variablesForEnvironment(activeEnvironment(this.state)));
+      this.syncParamsFromUrl();
+      const environment = activeEnvironment(this.state);
+      const variables = variablesForEnvironment(environment);
+      runPreRequestScript(request, variables);
+      if (environment) this.syncEnvironmentVariables(environment, variables);
+      const sentUrl = buildRequestUrl(request, variables);
+      const response = await sendHttpRequest(request, variables);
+      response.tests = runTestScript(request, response, variables);
       this.state.response = response;
       if (this.state.ui) this.state.ui.jsonCollapsed = [];
       this.state.history.unshift({
         id: crypto.randomUUID(),
         requestName: request.name,
         method: request.method,
-        url: request.url,
+        url: sentUrl,
+        request: cloneRequest(request),
         status: response.status,
         durationMs: response.durationMs,
         sentAt: Date.now(),
       });
       this.persistAndRender(`HTTP ${response.status} in ${response.durationMs} ms.`);
     } catch (error) {
-      this.callbacks.onNotify(error instanceof Error ? error.message : "Request failed.");
+      const message = error instanceof Error ? error.message : "Request failed.";
+      this.state.response = {
+        status: 0,
+        statusText: message,
+        headers: [],
+        cookies: [],
+        body: message,
+        durationMs: 0,
+        sizeBytes: 0,
+        redirected: false,
+        url: "",
+      };
+      this.persistAndRender(message);
     }
+  }
+
+  private syncEnvironmentVariables(environment: HttpEnvironment, variables: Record<string, string>): void {
+    const seen = new Set<string>();
+    environment.variables = environment.variables.map((row) => {
+      if (!row.key || !(row.key in variables)) return row;
+      seen.add(row.key);
+      return { ...row, value: variables[row.key] };
+    });
+    for (const [key, value] of Object.entries(variables)) {
+      if (!seen.has(key)) environment.variables.push(createRow(key, value, true));
+    }
+  }
+
+  private restoreHistoryEntry(historyId: string): void {
+    const entry = this.state.history.find((item) => item.id === historyId);
+    if (!entry) return;
+    const restored = entry.request ? cloneRequest(entry.request) : createRequest(entry.requestName || `${entry.method} ${entry.url}`, entry.method, entry.url);
+    restored.id = crypto.randomUUID();
+    restored.name = `${entry.requestName || entry.url} replay`;
+    this.state.draft = restored;
+    this.state.activeRequestId = restored.id;
+    this.state.response = undefined;
+    this.state.ui ??= { historyVisible: false, responseWidth: 50, responseHeight: 52, requestPanel: "params", responsePanel: "body" };
+    if (!this.state.ui.openTabs) this.state.ui.openTabs = [];
+    if (!this.state.ui.openTabs.includes(restored.id)) this.state.ui.openTabs.push(restored.id);
+    this.callbacks.onRenameTab(`HTTP: ${restored.name}`);
+    this.persistAndRender("History request loaded.");
   }
 
   private saveRequest(): void {
@@ -446,6 +607,28 @@ export class HttpClientView {
     this.state.activeRequestId = request.id;
     this.state.response = undefined;
     this.persistAndRender();
+  }
+
+  private duplicateRequest(requestId: string): void {
+    const source = findRequest(this.state.collections, requestId);
+    if (!source) return;
+    const duplicate = reidentifyRequest(cloneRequest(source));
+    duplicate.name = nextCopyName(source.name, this.state.collections.flatMap((collection) => flattenRequests(collection.items)).map((request) => request.name));
+    let inserted = false;
+    this.state.collections = this.state.collections.map((collection) => {
+      const items = insertRequestAfter(collection.items, requestId, duplicate, () => {
+        inserted = true;
+        this.state.activeCollectionId = collection.id;
+      });
+      return items === collection.items ? collection : { ...collection, items };
+    });
+    if (!inserted) return;
+    this.state.draft = cloneRequest(duplicate);
+    this.state.activeRequestId = duplicate.id;
+    this.state.response = undefined;
+    this.ensureOpenTabs();
+    this.callbacks.onRenameTab(`HTTP: ${duplicate.name}`);
+    this.persistAndRender("Request duplicated.");
   }
 
   private newCollection(): void {
@@ -504,12 +687,14 @@ export class HttpClientView {
 
   private setBodyMode(mode: HttpRequestItem["body"]["mode"]): void {
     this.state.draft.body.mode = mode;
+    this.syncContentTypeForBodyMode(mode);
   }
 
   private formatBodyJson(): void {
     try {
-      this.state.draft.body.raw = JSON.stringify(JSON.parse(this.state.draft.body.raw || "{}"), null, 2);
+      this.state.draft.body.raw = formatRequestJson(this.state.draft.body.raw);
       this.state.draft.body.mode = "json";
+      this.syncContentTypeForBodyMode("json");
       this.callbacks.onNotify("Formatted request JSON.");
     } catch (error) {
       this.callbacks.onNotify(error instanceof Error ? `Invalid JSON: ${error.message}` : "Invalid JSON.");
@@ -591,8 +776,10 @@ export class HttpClientView {
         return this.renderRows("headers", request.headers);
       case "body":
         return this.renderBody(request);
+      case "cookies":
+        return this.renderRows("cookies", request.cookies);
       case "scripts":
-        return `<div class="http-empty-panel">Pre-request and test scripts are not configured for this request.</div>`;
+        return this.renderScripts(request);
       case "settings":
         return `<div class="http-empty-panel">Request settings use the local HTTP proxy defaults.</div>`;
       case "params":
@@ -607,9 +794,9 @@ export class HttpClientView {
       case "headers":
         return this.renderReadonlyRows(response.headers);
       case "cookies":
-        return `<div class="http-empty-panel">No response cookies were captured.</div>`;
+        return (response.cookies ?? []).length ? this.renderReadonlyRows(response.cookies ?? []) : `<div class="http-empty-panel">No response cookies were captured.</div>`;
       case "tests":
-        return `<div class="http-empty-panel">No test results.</div>`;
+        return this.renderTestResults(response.tests ?? []);
       case "body":
       default:
         return renderJsonResponse(formatResponseBody(response), this.state.ui?.jsonCollapsed ?? []);
@@ -664,43 +851,85 @@ export class HttpClientView {
       <button class="http-request-item ${item.id === this.state.activeRequestId ? "active" : ""}" ${indent} data-http-request="${item.id}">
         <span>${item.method}</span>
         <span>${escapeHtml(item.name)}</span>
+        <small data-http-action="duplicate-request:${item.id}" title="Duplicate request">⧉</small>
         <small data-http-action="delete-request:${item.id}" title="Delete request">×</small>
       </button>
     `;
   }
 
   private renderEnvironmentPicker(): string {
+    const env = activeEnvironment(this.state);
     return `
       <select data-http-field="environment" class="http-env-select">
         ${this.state.environments
-          .map((env) => `<option value="${env.id}" ${env.id === this.state.activeEnvironmentId ? "selected" : ""}>${escapeHtml(env.name)}</option>`)
+          .map((e) => `<option value="${e.id}" ${e.id === this.state.activeEnvironmentId ? "selected" : ""}>${escapeHtml(e.name)}</option>`)
           .join("")}
       </select>
+      ${env ? `<input class="http-env-name-input" data-http-field="env-name" value="${escapeAttr(env.name)}" placeholder="Name" spellcheck="false" /><button class="mini-button danger" data-http-action="delete-environment" title="Delete Environment">×</button>` : ""}
     `;
   }
 
   private renderEnvironmentRows(): string {
     const environment = activeEnvironment(this.state);
-    return environment ? this.renderRows("env", environment.variables, false) : "";
+    return environment ? this.renderRows("env", environment.variables, true) : "";
   }
 
-  private renderRows(group: "params" | "headers" | "body" | "env", rows: KeyValueRow[], addButton = true): string {
-    const action = group === "params" ? "add-param-row" : group === "headers" ? "add-header-row" : group === "body" ? "add-body-row" : "add-env-row";
+  private renderUrlBackdrop(request: HttpRequestItem): string {
+    return `<div class="http-url-backdrop">${this.renderUrlBackdropContent(request)}</div>`;
+  }
+
+  private renderUrlBackdropContent(request: HttpRequestItem): string {
+    const url = request.url;
+    if (!url) return "";
+    const variables = variablesForEnvironment(activeEnvironment(this.state));
+    const parts = url.split(/(\{\{\s*[^}]+?\s*\}\})/g);
+    return parts.map((part) => {
+      const match = part.match(/^\{\{\s*([^}]+?)\s*\}\}$/);
+      if (match) {
+        const name = match[1].trim();
+        const defined = Object.prototype.hasOwnProperty.call(variables, name);
+        return `<span class="http-url-var-inline ${defined ? "valid" : "invalid"}">${escapeHtml(part)}</span>`;
+      }
+      return escapeHtml(part);
+    }).join("");
+  }
+
+  private renderUrlVarPopover(request: HttpRequestItem): string {
+    const names = variableNamesInText(request.url);
+    if (names.length === 0) return "";
+    const variables = variablesForEnvironment(activeEnvironment(this.state));
+    return `<div class="http-url-var-popover">${names.map((name) => {
+      const defined = Object.prototype.hasOwnProperty.call(variables, name);
+      const value = variables[name] ?? "";
+      return `<div class="http-url-var-popover-item ${defined ? "valid" : "invalid"}"><span class="http-url-var-popover-name">{{${escapeHtml(name)}}}</span>${defined ? `<input data-http-env-variable="${escapeAttr(name)}" value="${escapeAttr(value)}" spellcheck="false" />` : `<em>Not set — add in Environments</em>`}</div>`;
+    }).join("")}</div>`;
+  }
+
+  private renderRows(group: "params" | "headers" | "cookies" | "body" | "env", rows: KeyValueRow[], addButton = true): string {
+    const action = group === "params" ? "add-param-row" : group === "headers" ? "add-header-row" : group === "cookies" ? "add-cookie-row" : group === "body" ? "add-body-row" : "add-env-row";
     return `
-      <div class="http-kv-table" data-http-row-group="${group}">
+      <div class="http-kv-table ${addButton ? "with-actions" : ""}" data-http-row-group="${group}">
         ${rows
           .map(
-            (row) => `
-              <label class="http-kv-enabled"><input type="checkbox" data-row-enabled="${row.id}" ${row.enabled ? "checked" : ""} /></label>
-              <input data-row-key="${row.id}" value="${escapeAttr(row.key)}" placeholder="Key" spellcheck="false" />
-              <input data-row-value="${row.id}" value="${escapeAttr(row.value)}" placeholder="Value" spellcheck="false" />
-            `,
-          )
-          .join("")}
-      </div>
-      ${addButton ? `<button class="mini-button" data-http-action="${action}">Add row</button>` : ""}
-    `;
-  }
+	            (row) => `
+	              <label class="http-kv-enabled"><input type="checkbox" data-row-enabled="${row.id}" ${row.enabled ? "checked" : ""} /></label>
+	              <input data-row-key="${row.id}" value="${escapeAttr(row.key)}" placeholder="Key" spellcheck="false" />
+	              <input data-row-value="${row.id}" value="${escapeAttr(row.value)}" placeholder="Value" spellcheck="false" />
+                ${
+                  addButton
+                    ? `<div class="http-kv-actions">
+                        <button class="mini-button" data-http-action="add-row-after:${group}:${row.id}" title="Add row">+</button>
+                        <button class="mini-button danger" data-http-action="remove-row:${group}:${row.id}" title="Delete row">×</button>
+                      </div>`
+                    : ""
+                }
+	            `,
+	          )
+	          .join("")}
+	      </div>
+	      ${addButton && rows.length === 0 ? `<button class="mini-button" data-http-action="${action}">Add row</button>` : ""}
+	    `;
+	  }
 
   private renderReadonlyRows(rows: KeyValueRow[]): string {
     return `<div class="http-readonly-rows">${rows.map((row) => `<span>${escapeHtml(row.key)}</span><code>${escapeHtml(row.value)}</code>`).join("")}</div>`;
@@ -709,22 +938,79 @@ export class HttpClientView {
   private renderAuth(request: HttpRequestItem): string {
     const auth = request.auth;
     return `
-      <select data-http-field="auth-type">
-        <option value="none" ${auth.type === "none" ? "selected" : ""}>No Auth</option>
-        <option value="bearer" ${auth.type === "bearer" ? "selected" : ""}>Bearer Token</option>
-        <option value="basic" ${auth.type === "basic" ? "selected" : ""}>Basic Auth</option>
-        <option value="api-key" ${auth.type === "api-key" ? "selected" : ""}>API Key</option>
-      </select>
-      <div class="http-auth-grid">
-        <input data-http-field="auth-token" value="${escapeAttr(auth.type === "bearer" ? auth.token : "")}" placeholder="Token" />
-        <input data-http-field="auth-username" value="${escapeAttr(auth.type === "basic" ? auth.username : "")}" placeholder="Username" />
-        <input data-http-field="auth-password" value="${escapeAttr(auth.type === "basic" ? auth.password : "")}" placeholder="Password" type="password" />
-        <input data-http-field="auth-key" value="${escapeAttr(auth.type === "api-key" ? auth.key : "")}" placeholder="API key name" />
-        <input data-http-field="auth-value" value="${escapeAttr(auth.type === "api-key" ? auth.value : "")}" placeholder="API key value" />
-        <select data-http-field="auth-target">
-          <option value="header" ${auth.type === "api-key" && auth.target === "header" ? "selected" : ""}>Header</option>
-          <option value="query" ${auth.type === "api-key" && auth.target === "query" ? "selected" : ""}>Query</option>
+      <div class="http-auth-panel">
+        <select data-http-field="auth-type">
+          <option value="none" ${auth.type === "none" ? "selected" : ""}>No Auth</option>
+          <option value="bearer" ${auth.type === "bearer" ? "selected" : ""}>Bearer Token</option>
+          <option value="basic" ${auth.type === "basic" ? "selected" : ""}>Basic Auth</option>
+          <option value="api-key" ${auth.type === "api-key" ? "selected" : ""}>API Key</option>
         </select>
+        ${this.renderAuthFields(auth)}
+      </div>
+    `;
+  }
+
+  private renderAuthFields(auth: HttpRequestItem["auth"]): string {
+    if (auth.type === "bearer") {
+      return `
+        <div class="http-auth-grid single">
+          <input data-http-field="auth-token" value="${escapeAttr(auth.token)}" placeholder="Token" />
+        </div>
+      `;
+    }
+    if (auth.type === "basic") {
+      return `
+        <div class="http-auth-grid">
+          <input data-http-field="auth-username" value="${escapeAttr(auth.username)}" placeholder="Username" />
+          <input data-http-field="auth-password" value="${escapeAttr(auth.password)}" placeholder="Password" type="password" />
+        </div>
+      `;
+    }
+    if (auth.type === "api-key") {
+      return `
+        <div class="http-auth-grid">
+          <input data-http-field="auth-key" value="${escapeAttr(auth.key)}" placeholder="API key name" />
+          <input data-http-field="auth-value" value="${escapeAttr(auth.value)}" placeholder="API key value" />
+          <select data-http-field="auth-target">
+            <option value="header" ${auth.target === "header" ? "selected" : ""}>Header</option>
+            <option value="query" ${auth.target === "query" ? "selected" : ""}>Query</option>
+          </select>
+        </div>
+      `;
+    }
+    return `<div class="http-empty-panel compact">No authorization will be sent.</div>`;
+  }
+
+  private renderScripts(request: HttpRequestItem): string {
+    return `
+      <div class="http-script-grid">
+        <label>
+          <span>Pre-request script</span>
+          <textarea data-http-field="pre-request-script" spellcheck="false" placeholder="pm.variables.set('token', 'value');">${escapeHtml(request.scripts.preRequest)}</textarea>
+        </label>
+        <label>
+          <span>Test script</span>
+          <textarea data-http-field="test-script" spellcheck="false" placeholder="pm.test('status is 200', () => pm.expect(pm.response.code).to.equal(200));">${escapeHtml(request.scripts.test)}</textarea>
+        </label>
+      </div>
+    `;
+  }
+
+  private renderTestResults(results: HttpTestResult[]): string {
+    if (results.length === 0) return `<div class="http-empty-panel">No tests ran for this response.</div>`;
+    return `
+      <div class="http-test-results">
+        ${results
+          .map(
+            (result) => `
+              <div class="http-test-result ${result.passed ? "passed" : "failed"}">
+                <span>${result.passed ? "PASS" : "FAIL"}</span>
+                <strong>${escapeHtml(result.name)}</strong>
+                ${result.error ? `<code>${escapeHtml(result.error)}</code>` : ""}
+              </div>
+            `,
+          )
+          .join("")}
       </div>
     `;
   }
@@ -790,13 +1076,14 @@ export class HttpClientView {
           <span></span>
           <span>Key</span>
           <span>Value</span>
+          <span></span>
         </div>
         ${this.renderRows("body", request.body.form)}
       </div>
     `;
   }
 
-  private captureRows(group: "params" | "headers" | "body" | "env"): KeyValueRow[] | undefined {
+  private captureRows(group: "params" | "headers" | "cookies" | "body" | "env"): KeyValueRow[] | undefined {
     const table = this.root.querySelector<HTMLElement>(`[data-http-row-group='${group}']`);
     if (!table) return undefined;
     const keys = Array.from(table.querySelectorAll<HTMLInputElement>("[data-row-key]"));
@@ -807,6 +1094,90 @@ export class HttpClientView {
       return { id, key: keyInput.value, value: valueInput?.value ?? "", enabled: enabledInput?.checked ?? true };
     });
     return rows.length ? rows : [createRow()];
+  }
+
+  private syncParamsFromUrl(): boolean {
+    const query = queryStringFromUrl(this.state.draft.url);
+    if (query === undefined) return false;
+    const searchParams = new URLSearchParams(query);
+    const nextRows = Array.from(searchParams.entries()).map(([key, value]) => createRow(key, value, true));
+    const disabledRows = this.state.draft.params.filter((row) => !row.enabled && (row.key || row.value));
+    const next = [...nextRows, ...disabledRows];
+    if (next.length === 0) next.push(createRow());
+    if (rowsEquivalent(this.state.draft.params, next)) return false;
+    this.state.draft.params = next;
+    return true;
+  }
+
+  private syncUrlFromParams(): void {
+    const searchParams = new URLSearchParams();
+    for (const row of this.state.draft.params) {
+      if (row.enabled && row.key) searchParams.append(row.key, row.value);
+    }
+    this.state.draft.url = replaceUrlQuery(this.state.draft.url, searchParams.toString());
+  }
+
+  private writeUrlInput(): void {
+    const input = this.root.querySelector<HTMLInputElement>("[data-http-field='url']");
+    if (input && input.value !== this.state.draft.url) input.value = this.state.draft.url;
+  }
+
+  private addRowAfter(action: string): void {
+    const [, group, id] = action.split(":");
+    this.updateMutableRows(group, (rows) => {
+      const index = rows.findIndex((row) => row.id === id);
+      rows.splice(index === -1 ? rows.length : index + 1, 0, createRow());
+    });
+  }
+
+  private removeRow(action: string): void {
+    const [, group, id] = action.split(":");
+    this.updateMutableRows(group, (rows) => {
+      const next = rows.filter((row) => row.id !== id);
+      rows.splice(0, rows.length, ...(next.length ? next : [createRow()]));
+    });
+  }
+
+  private updateMutableRows(group: string, update: (rows: KeyValueRow[]) => void): void {
+    if (group === "params") update(this.state.draft.params);
+    else if (group === "headers") update(this.state.draft.headers);
+    else if (group === "cookies") update(this.state.draft.cookies);
+    else if (group === "body") update(this.state.draft.body.form);
+    else if (group === "env") {
+      const environment = activeEnvironment(this.state);
+      if (environment) update(environment.variables);
+    }
+    if (group === "params") this.syncUrlFromParams();
+  }
+
+  private updateEnvironmentVariable(name: string, value: string): void {
+    const environment = activeEnvironment(this.state);
+    if (!environment) return;
+    const row = environment.variables.find((candidate) => candidate.key === name);
+    if (row) {
+      row.value = value;
+      row.enabled = true;
+    } else {
+      environment.variables.push(createRow(name, value, true));
+    }
+  }
+
+  private syncContentTypeForBodyMode(mode: HttpRequestItem["body"]["mode"]): void {
+    const contentType = contentTypeForBodyMode(mode);
+    const index = this.state.draft.headers.findIndex((row) => row.key.toLowerCase() === "content-type");
+    if (!contentType) {
+      if (index !== -1 && isAutoContentType(this.state.draft.headers[index].value)) {
+        this.state.draft.headers.splice(index, 1);
+      }
+      return;
+    }
+    if (index === -1) {
+      this.state.draft.headers.push(createRow("Content-Type", contentType, true));
+      return;
+    }
+    if (isAutoContentType(this.state.draft.headers[index].value)) {
+      this.state.draft.headers[index] = { ...this.state.draft.headers[index], value: contentType, enabled: true };
+    }
   }
 
   private inputValue(selector: string): string {
@@ -826,6 +1197,82 @@ function safeFilename(value: string): string {
   return value.replace(/[^\w.-]+/g, "-").replace(/^-+|-+$/g, "") || "collection";
 }
 
+function reidentifyRequest(request: HttpRequestItem): HttpRequestItem {
+  request.id = crypto.randomUUID();
+  request.headers = request.headers.map((row) => ({ ...row, id: crypto.randomUUID() }));
+  request.params = request.params.map((row) => ({ ...row, id: crypto.randomUUID() }));
+  request.cookies = request.cookies.map((row) => ({ ...row, id: crypto.randomUUID() }));
+  request.body.form = request.body.form.map((row) => ({ ...row, id: crypto.randomUUID() }));
+  return request;
+}
+
+function nextCopyName(name: string, existingNames: string[]): string {
+  const base = name.replace(/\s+copy(?:\s+\d+)?$/i, "");
+  const used = new Set(existingNames);
+  if (!used.has(`${base} copy`)) return `${base} copy`;
+  let index = 2;
+  while (used.has(`${base} copy ${index}`)) index += 1;
+  return `${base} copy ${index}`;
+}
+
+function insertRequestAfter(
+  items: HttpCollection["items"],
+  requestId: string,
+  duplicate: HttpRequestItem,
+  markInserted: () => void,
+): HttpCollection["items"] {
+  let changed = false;
+  const next: HttpCollection["items"] = [];
+  for (const item of items) {
+    if (isHttpFolder(item)) {
+      const childItems = insertRequestAfter(item.items, requestId, duplicate, markInserted);
+      if (childItems !== item.items) {
+        changed = true;
+        next.push({ ...item, items: childItems });
+      } else {
+        next.push(item);
+      }
+      continue;
+    }
+    next.push(item);
+    if (item.id === requestId) {
+      changed = true;
+      markInserted();
+      next.push(cloneRequest(duplicate));
+    }
+  }
+  return changed ? next : items;
+}
+
+function rowsEquivalent(left: KeyValueRow[], right: KeyValueRow[]): boolean {
+  const compact = (rows: KeyValueRow[]) => rows.map((row) => ({ key: row.key, value: row.value, enabled: row.enabled }));
+  return JSON.stringify(compact(left)) === JSON.stringify(compact(right));
+}
+
+function queryStringFromUrl(value: string): string | undefined {
+  try {
+    return new URL(value).searchParams.toString();
+  } catch {
+    const queryStart = value.indexOf("?");
+    if (queryStart === -1) return "";
+    const hashStart = value.indexOf("#", queryStart);
+    return value.slice(queryStart + 1, hashStart === -1 ? undefined : hashStart);
+  }
+}
+
+function replaceUrlQuery(value: string, query: string): string {
+  const hashStart = value.indexOf("#");
+  const beforeHash = hashStart === -1 ? value : value.slice(0, hashStart);
+  const hash = hashStart === -1 ? "" : value.slice(hashStart);
+  const queryStart = beforeHash.indexOf("?");
+  const base = queryStart === -1 ? beforeHash : beforeHash.slice(0, queryStart);
+  return `${base}${query ? `?${query}` : ""}${hash}`;
+}
+
+function variableNamesInText(value: string): string[] {
+  return Array.from(new Set(Array.from(value.matchAll(/\{\{\s*([^}]+?)\s*\}\}/g), (match) => match[1].trim()).filter(Boolean)));
+}
+
 function removeRequestFromItems(items: HttpCollection["items"], requestId: string): HttpCollection["items"] {
   return items
     .map((item) => {
@@ -833,6 +1280,110 @@ function removeRequestFromItems(items: HttpCollection["items"], requestId: strin
       return { ...item, items: removeRequestFromItems(item.items, requestId) };
     })
     .filter((item): item is HttpCollection["items"][number] => Boolean(item));
+}
+
+function runPreRequestScript(request: HttpRequestItem, variables: Record<string, string>): void {
+  if (!request.scripts.preRequest.trim()) return;
+  runUserScript(request.scripts.preRequest, request, undefined, variables, undefined);
+}
+
+function runTestScript(request: HttpRequestItem, response: HttpResponse, variables: Record<string, string>): HttpTestResult[] {
+  const results: HttpTestResult[] = [];
+  if (!request.scripts.test.trim()) return results;
+  runUserScript(request.scripts.test, request, response, variables, results);
+  return results;
+}
+
+function runUserScript(
+  script: string,
+  request: HttpRequestItem,
+  response: HttpResponse | undefined,
+  variables: Record<string, string>,
+  results: HttpTestResult[] | undefined,
+): void {
+  const variableApi = {
+    get: (name: string) => variables[name],
+    set: (name: string, value: unknown) => {
+      variables[String(name)] = String(value ?? "");
+    },
+    unset: (name: string) => {
+      delete variables[String(name)];
+    },
+  };
+  const responseApi = response
+    ? {
+        code: response.status,
+        status: response.statusText,
+        headers: Object.fromEntries(response.headers.map((row) => [row.key.toLowerCase(), row.value])),
+        cookies: Object.fromEntries((response.cookies ?? []).map((row) => [row.key, row.value])),
+        text: () => response.body,
+        json: () => JSON.parse(response.body),
+      }
+    : undefined;
+  const pm = {
+    request,
+    response: responseApi,
+    variables: variableApi,
+    environment: variableApi,
+    test: (name: string, fn: () => void) => {
+      if (!results) return;
+      try {
+        fn();
+        results.push({ id: crypto.randomUUID(), name: String(name), passed: true });
+      } catch (error) {
+        results.push({ id: crypto.randomUUID(), name: String(name), passed: false, error: error instanceof Error ? error.message : String(error) });
+      }
+    },
+    expect,
+  };
+
+  try {
+    new Function("pm", "request", "response", "variables", `"use strict";\n${script}`)(pm, request, responseApi, variableApi);
+  } catch (error) {
+    if (results) {
+      results.push({ id: crypto.randomUUID(), name: "Script error", passed: false, error: error instanceof Error ? error.message : String(error) });
+    } else {
+      throw error;
+    }
+  }
+}
+
+function expect(actual: unknown) {
+  const fail = (message: string): never => {
+    throw new Error(message);
+  };
+  const api = {
+    equal: (expected: unknown) => {
+      if (actual !== expected) fail(`expected ${JSON.stringify(actual)} to equal ${JSON.stringify(expected)}`);
+    },
+    eql: (expected: unknown) => {
+      if (JSON.stringify(actual) !== JSON.stringify(expected)) fail(`expected ${JSON.stringify(actual)} to deeply equal ${JSON.stringify(expected)}`);
+    },
+    include: (expected: unknown) => {
+      if (typeof actual === "string" && typeof expected === "string" && actual.includes(expected)) return;
+      if (Array.isArray(actual) && actual.includes(expected)) return;
+      fail(`expected ${JSON.stringify(actual)} to include ${JSON.stringify(expected)}`);
+    },
+    above: (expected: number) => {
+      if (!(Number(actual) > expected)) fail(`expected ${JSON.stringify(actual)} to be above ${expected}`);
+    },
+    below: (expected: number) => {
+      if (!(Number(actual) < expected)) fail(`expected ${JSON.stringify(actual)} to be below ${expected}`);
+    },
+  };
+  return {
+    to: {
+      ...api,
+      be: {
+        true: () => {
+          if (actual !== true) fail(`expected ${JSON.stringify(actual)} to be true`);
+        },
+        false: () => {
+          if (actual !== false) fail(`expected ${JSON.stringify(actual)} to be false`);
+        },
+      },
+    },
+  };
 }
 
 function formatBytes(bytes: number): string {

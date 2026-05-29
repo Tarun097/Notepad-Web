@@ -21,6 +21,11 @@ export interface HttpBody {
   form: KeyValueRow[];
 }
 
+export interface HttpScripts {
+  preRequest: string;
+  test: string;
+}
+
 export interface HttpRequestItem {
   id: string;
   name: string;
@@ -28,8 +33,10 @@ export interface HttpRequestItem {
   url: string;
   headers: KeyValueRow[];
   params: KeyValueRow[];
+  cookies: KeyValueRow[];
   auth: HttpAuth;
   body: HttpBody;
+  scripts: HttpScripts;
 }
 
 export interface HttpFolder {
@@ -56,12 +63,21 @@ export interface HttpResponse {
   status: number;
   statusText: string;
   headers: KeyValueRow[];
+  cookies: KeyValueRow[];
   body: string;
   bodyBase64?: boolean;
   durationMs: number;
   sizeBytes: number;
   redirected: boolean;
   url: string;
+  tests?: HttpTestResult[];
+}
+
+export interface HttpTestResult {
+  id: string;
+  name: string;
+  passed: boolean;
+  error?: string;
 }
 
 export interface HttpHistoryEntry {
@@ -69,6 +85,7 @@ export interface HttpHistoryEntry {
   requestName: string;
   method: HttpMethod;
   url: string;
+  request?: HttpRequestItem;
   status?: number;
   durationMs?: number;
   sentAt: number;
@@ -90,7 +107,7 @@ export interface HttpClientUiState {
   historyVisible: boolean;
   responseWidth: number;
   responseHeight: number;
-  requestPanel: "params" | "auth" | "headers" | "body" | "scripts" | "settings";
+  requestPanel: "params" | "auth" | "headers" | "body" | "cookies" | "scripts" | "settings";
   responsePanel: "body" | "cookies" | "headers" | "tests";
   jsonCollapsed?: number[];
   openTabs?: string[];
